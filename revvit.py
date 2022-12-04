@@ -16,7 +16,6 @@ class GELU(nn.Module):
     def forward(self, input): 
         return F.relu(input)
 
-
 class RevViT_GLOW(nn.Module): 
 
     class Block(nn.Module):
@@ -148,32 +147,20 @@ class RevViT_GLOW(nn.Module):
                 )
 
             def forward(self, x): 
-                x2, x1 = x.chunk(2, 1)
+                x2, x1 = x.chunk(2, -1)
+                x2, x1 = [i.squeeze(-1) for i in [x2, x1]]
                 y2 = x2 + self.attn(self.norm1(x1)) 
                 y1 = x1 + self.mlp(self.norm2(y2)) 
-                return torch.cat([y1, y2], 1) 
+                y2, y1 = [i.unsqueeze(-1) for i in [y2, y1]] 
+                return torch.cat([y1, y2], -1) 
 
             def reverse(self, y): 
-                y1, y2 = y.chunk(2, 1) 
+                y1, y2 = y.chunk(2, -1) 
+                y1, y2 = [i.squeeze(-1) for i in [y1, y2]] 
                 x1 = y1 - self.mlp(self.norm2(y2)) 
                 x2 = y2 - self.attn(self.norm1(x1)) 
-                return torch.cat([x2, x1], 1) 
-
-        # class ZeroConv2d(nn.Module):
-        #     def __init__(self, in_channel, out_channel, padding=1):
-        #         super().__init__()
-
-        #         self.conv = nn.Conv2d(in_channel, out_channel, 3, padding=0)
-        #         self.conv.weight.data.zero_()
-        #         self.conv.bias.data.zero_()
-        #         self.scale = nn.Parameter(torch.zeros(1, out_channel, 1, 1))
-
-        #     def forward(self, input):
-        #         out = F.pad(input, [1, 1, 1, 1], value=1)
-        #         out = self.conv(out)
-        #         out = out * torch.exp(self.scale * 3)
-
-        #         return out
+                x1, x2 = [i.unsqueeze(-1) for i in [x1, x2]]
+                return torch.cat([x2, x1], -1) 
 
         def _gaussian_log_p(self, x, mean, log_sd):
             '''
@@ -188,8 +175,10 @@ class RevViT_GLOW(nn.Module):
             eps = torch.randn_like(mean)
             return mean + torch.exp(sigma / 2) * eps
 
-        def __init__(self, dim, n_heads, n_flow, n_patches, mlp_ratio=4.0, qkv_bias=True, p=0., attn_p=0.):
+        def __init__(self, dim, n_heads, n_flow, n_patches, mlp_ratio=4.0, qkv_bias=True, p=0., attn_p=0., split_sz=4, split=True):
             super().__init__()
+            self.split = split 
+            self.split_sz = split_sz 
 
             # Learnable parameter that will represent the first token in the sequence.
             self.cls_token = nn.Parameter(torch.zeros(1, 1, dim)) 
@@ -197,12 +186,10 @@ class RevViT_GLOW(nn.Module):
             # Position embedding. 
             self.pos_embed = nn.Parameter(torch.zeros(1, 1 + n_patches, dim)) 
 
-            dim //= 2
-
             self.flows = nn.ModuleList(
                 [
                     self.Transformer(
-                        dim=dim, 
+                        dim=dim // 2, 
                         n_heads=n_heads, 
                         mlp_ratio=mlp_ratio, 
                         qkv_bias=qkv_bias, 
@@ -220,35 +207,36 @@ class RevViT_GLOW(nn.Module):
             n_samples = x.shape[0]
             cls_token = self.cls_token.expand(n_samples, -1, -1 )  # (n_samples, 1, embed_dim)
 
-            print(self.pos_embed.shape, x.shape)
-
             x = torch.cat((cls_token, x), dim=1)  # (n_samples, 1 + n_patches, embed_dim)
             x = x + self.pos_embed  # (n_samples, 1 + n_patches, embed_dim) 
 
             n_samples, n_patches, embed_dim = x.shape 
-            squeezed = x.view(n_samples, n_patches, embed_dim // 2, 2)
-            squeezed = squeezed.permute(0, 1, 3, 2)  # n_samples, n_patches, 2, embed_dim // 2
-            x = squeezed.contiguous().view(n_samples, n_patches * 2, embed_dim // 2)
+            x = x.view(n_samples, n_patches, embed_dim // 2, 2)
 
-            # x = torch.cat([x, x], -1) # TODO
             for flow in self.flows: 
                 x = flow(x) 
 
-            z_new, x = x.split([1, x.shape[1]-1], dim=1) # Split out the CLS token
+            x = x.view(n_samples, n_patches, embed_dim) 
+
+            if self.split: 
+                z_new, x = x.split([self.split_sz, x.shape[1]-self.split_sz], dim=1) # Split out the CLS token
+            else: 
+                z_new = x 
             mean, sigma = self.prior( self.norm(z_new) ).chunk(2, -1) 
 
             return x, mean, sigma, z_new
 
-        def reverse(self, x, z):
-            x = torch.cat([z,x], 1) 
+        def reverse(self, x, z=None):
+            if self.split: 
+                x = torch.cat([z,x], 1) 
+
+            n_samples, n_patches, embed_dim = x.shape 
+            x = x.view(n_samples, n_patches, embed_dim // 2, 2)
 
             for flow in self.flows[::-1]:
                 x = flow.reverse(x) 
 
-            n_samples, n_patches_, embed_dim_ = x.shape 
-            unsqueezed = x.view(n_samples, n_patches_ // 2, 2, embed_dim_)
-            unsqueezed = unsqueezed.permute(0, 1, 3, 2)
-            unsqueezed = unsqueezed.contiguous().view(n_samples, n_patches_ // 2, embed_dim_ * 2)
+            x = x.view(n_samples, n_patches, embed_dim) 
 
             x = x - self.pos_embed 
             _, x = x.split([1,x.shape[1]-1], dim=1)
@@ -263,33 +251,27 @@ class RevViT_GLOW(nn.Module):
             self.patch_size = patch_size
             self.n_patches = (img_size // patch_size) ** 2
             self.embed_dim = embed_dim
-
-            # self.proj = nn.Conv2d(
-            #         in_chans,
-            #         embed_dim,
-            #         kernel_size=patch_size,
-            #         stride=patch_size,
-            #         bias=False 
-            # )
+            self.in_chans = in_chans 
 
         def forward(self, x):
-            # x = self.proj(x)  # (n_samples, embed_dim, n_patches ** 0.5, n_patches ** 0.5)
-
-            # (n_samples, in_chans, img_size, img_size) 
             n_split = int(self.n_patches ** 0.5) 
             x = torch.cat(
                 [b.contiguous().view(x.shape[0], self.embed_dim, 1) for a in x.chunk(n_split, dim=2) \
                     for b in a.chunk(n_split, dim=3)], 
                 dim=-1) 
 
-            # x = x.flatten(2)  # (n_samples, embed_dim, n_patches)
             x = x.transpose(1, 2)  # (n_samples, n_patches, embed_dim)
             return x
 
         def reverse(self, x): 
-            x = x.transpose(1, 2) 
-            x = x.view(x.shape[0], self.embed_dim, self.n_patches ** 0.5, self.n_patches ** 0.5) 
-            # TODO
+            n_split = int(self.n_patches ** 0.5) 
+            n_samples = x.shape[0]
+
+            x = x.view(n_samples, n_split, n_split, self.in_chans, self.patch_size, self.patch_size)\
+                .permute(0,3,1,4,2,5).contiguous()\
+                    .view(n_samples, self.in_chans, self.img_size, self.img_size)
+            return x 
+            
 
     """Custom implementation of the Vision transformer.
     Parameters
@@ -319,17 +301,22 @@ class RevViT_GLOW(nn.Module):
             img_size=384,
             patch_size=16,
             in_chans=3,
-            depth=4,
             n_heads=12,
             n_flow=12, 
             mlp_ratio=4.,
             qkv_bias=True,
             p=0.,
             attn_p=0.,
+            split_sz=4, 
     ):
         n_patches = (img_size // patch_size) ** 2
         embed_dim = (img_size ** 2) * in_chans // n_patches 
+        depth = int(1 / (split_sz - 1) * n_patches) 
+
+        print("depth: {}, n_patches: {}".format(depth, n_patches)) 
+
         super().__init__()
+
         self.patch_embed = self.PatchEmbed(
             img_size=img_size, 
             patch_size=patch_size, 
@@ -339,7 +326,7 @@ class RevViT_GLOW(nn.Module):
 
         self.blocks = nn.ModuleList()
         dim = embed_dim 
-        for i in range(depth):
+        for i in range(depth-1):
             self.blocks.append(
                 self.Block(
                     dim=dim,
@@ -349,11 +336,26 @@ class RevViT_GLOW(nn.Module):
                     mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias,
                     p=p,
-                    attn_p=attn_p 
+                    attn_p=attn_p, 
+                    split_sz=split_sz 
                 )
             )
-            dim //= 2
-            n_patches = (n_patches + 1) * 2 - 1
+            n_patches -= 3
+
+        self.blocks.append(
+            self.Block(
+                dim=dim,
+                n_flow=n_flow, 
+                n_heads=n_heads,
+                n_patches=n_patches, 
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                p=p,
+                attn_p=attn_p, 
+                split_sz=split_sz, 
+                split=False 
+            )
+        )
 
     def forward(self, x): 
         x = self.patch_embed(x)
@@ -362,36 +364,47 @@ class RevViT_GLOW(nn.Module):
         z_outs = list() 
 
         for block in self.blocks:
+            print(x.shape)
             x, mean, sigma, z_new = block(x)
-            mean_list.append(mean) 
-            sigma_list.append(sigma) 
-            z_outs.append(z_new) 
+            mean_list.append(mean.unsqueeze(1)) 
+            sigma_list.append(sigma.unsqueeze(1)) 
+            z_outs.append(z_new.unsqueeze(1)) 
 
-        mean_list = torch.cat(mean_list, dim=-1) 
-        sigma_list = torch.cat(sigma_list, dim=-1) 
-        z_outs = torch.cat(z_outs, dim=-1) 
-        
+        mean_list = torch.cat(mean_list, dim=1) 
+        sigma_list = torch.cat(sigma_list, dim=1) 
+        z_outs = torch.cat(z_outs, dim=1) 
+
         return mean_list, sigma_list, z_outs
 
-    def reverse(self, z_list, reconstruct=False): 
+    def reverse(self, z_list): 
+        z_list = [i.squeeze(1) for i in z_list.chunk(z_list.shape[1], 1)]
         for i, block in enumerate(self.blocks[::-1]):
-            x = block.reverse(x, z_list[-(i + 1)]) 
+            if i == 0: 
+                x = block.reverse(z_list[-(i + 1)]) 
+            else: 
+                x = block.reverse(x, z_list[-(i + 1)]) 
+        x = self.patch_embed.reverse(x)
 
         return x
 
 
 # Dataset 
-path = r"D:\Dataset\archive\maps\maps"
-batch_size = 4 #16 
+path = r"D:\Dataset\img_align_celeba"
+batch_size = 1 #16 
 img_size = 32 #64 
 n_bits = 5 
 n = 0 
 
 # Model 
-n_flow = 32 
-n_block = 4 #4
-use_affine = False 
-use_lu = True 
+img_size = 96 #384
+patch_size = 16
+in_chans = 3
+n_heads = 12
+n_flow = 4 # 12 
+mlp_ratio = 4.
+qkv_bias = True
+p = 0.
+attn_p = 0.
 
 # Train 
 lr = 1e-4
@@ -402,8 +415,8 @@ iteration = 200000
 def sample_data(path, batch_size, image_size):
     transform = transforms.Compose(
         [
-            transforms.Resize((image_size,image_size*2)),
-            transforms.CenterCrop((image_size,image_size*2)),
+            transforms.Resize((image_size,image_size)),
+            transforms.CenterCrop((image_size,image_size)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
         ]
@@ -429,16 +442,15 @@ dataset = iter(sample_data(path, batch_size, img_size))
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # device = torch.device("cpu") 
 
-model = RevViT_GLOW(img_size=96, #384,
-                    patch_size=16,
-                    in_chans=3,
-                    depth=4,
-                    n_heads=12,
-                    n_flow=12, 
-                    mlp_ratio=4.,
-                    qkv_bias=True,
-                    p=0.,
-                    attn_p=0.
+model = RevViT_GLOW(img_size=img_size,
+                    patch_size=patch_size,
+                    in_chans=in_chans,
+                    n_heads=n_heads,
+                    n_flow=n_flow, 
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    p=p,
+                    attn_p=attn_p
             )
 
 # net = nn.DataParallel(model).to(device)
