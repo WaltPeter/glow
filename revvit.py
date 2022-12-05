@@ -1,7 +1,7 @@
 from tqdm import tqdm 
 import numpy as np 
-from PIL import Image 
-from math import log
+from PIL import Image
+import math
 
 import torch
 from torch import nn, optim
@@ -11,10 +11,28 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms, utils 
 from math import log, pi, exp
 
-# TODO: GELU not avail for 1.1
 class GELU(nn.Module): 
-    def forward(self, input): 
-        return F.relu(input)
+    def forward(self, x): 
+        return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+
+class Linear(nn.Linear): 
+    def __init__(self, in_features, out_features, bias=True):
+        nn.Linear.__init__(self, in_features=in_features, out_features=out_features, bias=bias) 
+    
+    def reverse(self, x): 
+        x = x - self.bias[None, ...] 
+        x = x[..., None] 
+        x = torch.solve(x, self.weight)[0] 
+        x = torch.squeeze(x, dim=-1) 
+        return x 
+    
+class Tanh(nn.Tanh): 
+    def __init__(self):
+        nn.Tanh.__init__(self)  
+    
+    def reverse(self, x): 
+        return 0.5 * torch.log((1 + x) / (1 - x)) 
+
 
 class RevViT_GLOW(nn.Module): 
 
@@ -162,15 +180,6 @@ class RevViT_GLOW(nn.Module):
                 x1, x2 = [i.unsqueeze(-1) for i in [x1, x2]]
                 return torch.cat([x2, x1], -1) 
 
-        def _gaussian_log_p(self, x, mean, log_sd):
-            '''
-            f(x)=1./[std*(2*pi)^0.5]*exp{-0.5*[(x-mean)/std]^2}
-            log f(x)=-log[std*(2*pi)^0.5]-0.5*[(x-mean)/std]^2
-                    =-0.5*log(2*pi)-log_std-0.5*(x-mean)^2/[exp(log_std)]^2
-                    =-0.5*log(2*pi)-log_std-0.5*(x-mean)^2/[exp(2*log_std)]
-            '''
-            return -0.5 * log(2 * pi) - log_sd - 0.5 * (x - mean) ** 2 / torch.exp(2 * log_sd)
-
         def _sample_z(self, mean, sigma): 
             eps = torch.randn_like(mean)
             return mean + torch.exp(sigma / 2) * eps
@@ -179,12 +188,6 @@ class RevViT_GLOW(nn.Module):
             super().__init__()
             self.split = split 
             self.split_sz = split_sz 
-
-            # Learnable parameter that will represent the first token in the sequence.
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, dim)) 
-
-            # Position embedding. 
-            self.pos_embed = nn.Parameter(torch.zeros(1, 1 + n_patches, dim)) 
 
             self.flows = nn.ModuleList(
                 [
@@ -200,15 +203,17 @@ class RevViT_GLOW(nn.Module):
                 ]
             )
 
+            self.fc_layers = nn.ModuleList()
+            for _ in range(2): 
+                self.fc_layers.append(Linear(n_patches, n_patches))
+                self.fc_layers.append(Tanh())
+
             self.norm = nn.LayerNorm(dim, eps=1e-6) 
             self.prior = nn.Linear(dim, dim * 2)  
 
         def forward(self, x):
-            n_samples = x.shape[0]
-            cls_token = self.cls_token.expand(n_samples, -1, -1 )  # (n_samples, 1, embed_dim)
-
-            x = torch.cat((cls_token, x), dim=1)  # (n_samples, 1 + n_patches, embed_dim)
-            x = x + self.pos_embed  # (n_samples, 1 + n_patches, embed_dim) 
+            _log = list() 
+            _log.append(x.sum().data)
 
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
@@ -216,7 +221,16 @@ class RevViT_GLOW(nn.Module):
             for flow in self.flows: 
                 x = flow(x) 
 
-            x = x.view(n_samples, n_patches, embed_dim) 
+            x = x.view(n_samples, n_patches, embed_dim)
+
+            _log.append(x.sum().data)
+            
+            x = x.transpose(1,2) 
+            for layer in self.fc_layers: 
+                x = layer(x) 
+            x = x.transpose(1,2) 
+
+            _log.append(x.sum().data)
 
             if self.split: 
                 z_new, x = x.split([self.split_sz, x.shape[1]-self.split_sz], dim=1) # Split out the CLS token
@@ -224,11 +238,25 @@ class RevViT_GLOW(nn.Module):
                 z_new = x 
             mean, sigma = self.prior( self.norm(z_new) ).chunk(2, -1) 
 
-            return x, mean, sigma, z_new
+            _log.append(x.sum().data)
+
+            return x, mean, sigma, z_new, _log 
 
         def reverse(self, x, z=None):
+            _log = list() 
+            _log.append(x.sum().data)
+
             if self.split: 
                 x = torch.cat([z,x], 1) 
+
+            _log.append(x.sum().data)
+
+            x = x.transpose(1,2) 
+            for layer in self.fc_layers[::-1]: 
+                x = layer.reverse(x) 
+            x = x.transpose(1,2) 
+
+            _log.append(x.sum().data)
 
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
@@ -238,10 +266,9 @@ class RevViT_GLOW(nn.Module):
 
             x = x.view(n_samples, n_patches, embed_dim) 
 
-            x = x - self.pos_embed 
-            _, x = x.split([1,x.shape[1]-1], dim=1)
+            _log.append(x.sum().data)
 
-            return x
+            return x, _log 
 
     class PatchEmbed(nn.Module):
         # Split image into patches and then embed them.
@@ -310,10 +337,10 @@ class RevViT_GLOW(nn.Module):
             split_sz=4, 
     ):
         n_patches = (img_size // patch_size) ** 2
-        embed_dim = (img_size ** 2) * in_chans // n_patches 
-        depth = int(1 / (split_sz - 1) * n_patches) 
+        dim = (img_size ** 2) * in_chans // n_patches 
+        depth = int(1 / split_sz * n_patches + 1) 
 
-        print("depth: {}, n_patches: {}".format(depth, n_patches)) 
+        print("depth: {}, n_patches: {}+{}".format(depth, split_sz, n_patches)) 
 
         super().__init__()
 
@@ -321,11 +348,19 @@ class RevViT_GLOW(nn.Module):
             img_size=img_size, 
             patch_size=patch_size, 
             in_chans=in_chans, 
-            embed_dim=embed_dim
+            embed_dim=dim
         )
 
+        # Learnable parameter that will represent the first token in the sequence.
+        self.cls_token = nn.Parameter(torch.zeros(1, split_sz, dim)) 
+
+        # Position embedding. 
+        self.pos_embed = nn.Parameter(torch.zeros(1, split_sz + n_patches, dim)) 
+
+        n_patches += split_sz
+        self.split_sz = split_sz 
+
         self.blocks = nn.ModuleList()
-        dim = embed_dim 
         for i in range(depth-1):
             self.blocks.append(
                 self.Block(
@@ -337,10 +372,11 @@ class RevViT_GLOW(nn.Module):
                     qkv_bias=qkv_bias,
                     p=p,
                     attn_p=attn_p, 
-                    split_sz=split_sz 
+                    split_sz=split_sz, 
+                    split=False 
                 )
             )
-            n_patches -= 3
+            # n_patches -= split_sz
 
         self.blocks.append(
             self.Block(
@@ -363,29 +399,45 @@ class RevViT_GLOW(nn.Module):
         sigma_list = list() 
         z_outs = list() 
 
+        _log_list = list() 
+
+        n_samples = x.shape[0]
+        cls_token = self.cls_token.expand(n_samples, -1, -1)  # (n_samples, split_sz, embed_dim)
+
+        x = torch.cat((cls_token, x), dim=1)  # (n_samples, split_sz + n_patches, embed_dim)
+        x = x + self.pos_embed  # (n_samples, split_sz + n_patches, embed_dim) 
+
         for block in self.blocks:
-            print(x.shape)
-            x, mean, sigma, z_new = block(x)
+            x, mean, sigma, z_new, _log = block(x)
             mean_list.append(mean.unsqueeze(1)) 
             sigma_list.append(sigma.unsqueeze(1)) 
             z_outs.append(z_new.unsqueeze(1)) 
+            
+            _log_list.append(_log) 
 
         mean_list = torch.cat(mean_list, dim=1) 
         sigma_list = torch.cat(sigma_list, dim=1) 
         z_outs = torch.cat(z_outs, dim=1) 
 
-        return mean_list, sigma_list, z_outs
+        return mean_list, sigma_list, z_outs, _log_list 
 
     def reverse(self, z_list): 
+        _log_list = list() 
+
         z_list = [i.squeeze(1) for i in z_list.chunk(z_list.shape[1], 1)]
         for i, block in enumerate(self.blocks[::-1]):
             if i == 0: 
-                x = block.reverse(z_list[-(i + 1)]) 
+                x, _log = block.reverse(z_list[-(i + 1)]) 
             else: 
-                x = block.reverse(x, z_list[-(i + 1)]) 
+                x, _log = block.reverse(x, z_list[-(i + 1)]) 
+            _log_list.append(_log) 
+        
+        x = x - self.pos_embed 
+        _, x = x.split([self.split_sz, x.shape[1]-self.split_sz], dim=1)
+
         x = self.patch_embed.reverse(x)
 
-        return x
+        return x, _log_list
 
 
 # Dataset 
@@ -400,7 +452,7 @@ img_size = 96 #384
 patch_size = 16
 in_chans = 3
 n_heads = 12
-n_flow = 4 # 12 
+n_flow = 2 # 12 
 mlp_ratio = 4.
 qkv_bias = True
 p = 0.
