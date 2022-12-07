@@ -15,24 +15,6 @@ class GELU(nn.Module):
     def forward(self, x): 
         return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
 
-class Linear(nn.Linear): 
-    def __init__(self, in_features, out_features, bias=True):
-        nn.Linear.__init__(self, in_features=in_features, out_features=out_features, bias=bias) 
-    
-    def reverse(self, x): 
-        x = x - self.bias[None, ...] 
-        x = x[..., None] 
-        x = torch.solve(x, self.weight)[0] 
-        x = torch.squeeze(x, dim=-1) 
-        return x 
-    
-class Tanh(nn.Tanh): 
-    def __init__(self):
-        nn.Tanh.__init__(self)  
-    
-    def reverse(self, x): 
-        return 0.5 * torch.log((1 + x) / (1 - x)) 
-
 
 class RevViT_GLOW(nn.Module): 
 
@@ -203,18 +185,11 @@ class RevViT_GLOW(nn.Module):
                 ]
             )
 
-            self.fc_layers = nn.ModuleList()
-            for _ in range(2): 
-                self.fc_layers.append(Linear(n_patches, n_patches))
-                self.fc_layers.append(Tanh())
-
-            self.norm = nn.LayerNorm(dim, eps=1e-6) 
-            self.prior = nn.Linear(dim, dim * 2)  
+            latent_dim = 16*16
+            self.norm = nn.LayerNorm(split_sz*dim, eps=1e-6) 
+            self.prior = nn.Linear(split_sz*dim, latent_dim*2)  
 
         def forward(self, x):
-            _log = list() 
-            _log.append(x.sum().data)
-
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
 
@@ -223,40 +198,19 @@ class RevViT_GLOW(nn.Module):
 
             x = x.view(n_samples, n_patches, embed_dim)
 
-            _log.append(x.sum().data)
-            
-            x = x.transpose(1,2) 
-            for layer in self.fc_layers: 
-                x = layer(x) 
-            x = x.transpose(1,2) 
-
-            _log.append(x.sum().data)
-
             if self.split: 
                 z_new, x = x.split([self.split_sz, x.shape[1]-self.split_sz], dim=1) # Split out the CLS token
             else: 
                 z_new = x 
-            mean, sigma = self.prior( self.norm(z_new) ).chunk(2, -1) 
 
-            _log.append(x.sum().data)
+            flatten = torch.flatten(z_new, start_dim=1) 
+            mean, sigma = self.prior( self.norm(flatten) ).chunk(2, -1) 
 
-            return x, mean, sigma, z_new, _log 
+            return x, mean, sigma, z_new 
 
         def reverse(self, x, z=None):
-            _log = list() 
-            _log.append(x.sum().data)
-
             if self.split: 
                 x = torch.cat([z,x], 1) 
-
-            _log.append(x.sum().data)
-
-            x = x.transpose(1,2) 
-            for layer in self.fc_layers[::-1]: 
-                x = layer.reverse(x) 
-            x = x.transpose(1,2) 
-
-            _log.append(x.sum().data)
 
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
@@ -266,9 +220,7 @@ class RevViT_GLOW(nn.Module):
 
             x = x.view(n_samples, n_patches, embed_dim) 
 
-            _log.append(x.sum().data)
-
-            return x, _log 
+            return x 
 
     class PatchEmbed(nn.Module):
         # Split image into patches and then embed them.
@@ -372,11 +324,10 @@ class RevViT_GLOW(nn.Module):
                     qkv_bias=qkv_bias,
                     p=p,
                     attn_p=attn_p, 
-                    split_sz=split_sz, 
-                    split=False 
+                    split_sz=split_sz 
                 )
             )
-            # n_patches -= split_sz
+            n_patches -= split_sz
 
         self.blocks.append(
             self.Block(
@@ -399,8 +350,6 @@ class RevViT_GLOW(nn.Module):
         sigma_list = list() 
         z_outs = list() 
 
-        _log_list = list() 
-
         n_samples = x.shape[0]
         cls_token = self.cls_token.expand(n_samples, -1, -1)  # (n_samples, split_sz, embed_dim)
 
@@ -408,41 +357,37 @@ class RevViT_GLOW(nn.Module):
         x = x + self.pos_embed  # (n_samples, split_sz + n_patches, embed_dim) 
 
         for block in self.blocks:
-            x, mean, sigma, z_new, _log = block(x)
+            x, mean, sigma, z_new = block(x)
             mean_list.append(mean.unsqueeze(1)) 
             sigma_list.append(sigma.unsqueeze(1)) 
             z_outs.append(z_new.unsqueeze(1)) 
-            
-            _log_list.append(_log) 
 
         mean_list = torch.cat(mean_list, dim=1) 
         sigma_list = torch.cat(sigma_list, dim=1) 
         z_outs = torch.cat(z_outs, dim=1) 
 
-        return mean_list, sigma_list, z_outs, _log_list 
+        return mean_list, sigma_list, z_outs 
 
     def reverse(self, z_list): 
-        _log_list = list() 
 
         z_list = [i.squeeze(1) for i in z_list.chunk(z_list.shape[1], 1)]
         for i, block in enumerate(self.blocks[::-1]):
             if i == 0: 
-                x, _log = block.reverse(z_list[-(i + 1)]) 
+                x = block.reverse(z_list[-(i + 1)]) 
             else: 
-                x, _log = block.reverse(x, z_list[-(i + 1)]) 
-            _log_list.append(_log) 
+                x = block.reverse(x, z_list[-(i + 1)]) 
         
         x = x - self.pos_embed 
         _, x = x.split([self.split_sz, x.shape[1]-self.split_sz], dim=1)
 
         x = self.patch_embed.reverse(x)
 
-        return x, _log_list
+        return x
 
 
 # Dataset 
 path = r"D:\Dataset\img_align_celeba"
-batch_size = 1 #16 
+batch_size = 16 
 img_size = 32 #64 
 n_bits = 5 
 n = 0 
@@ -461,6 +406,7 @@ attn_p = 0.
 # Train 
 lr = 1e-4
 iteration = 200000
+kld_weight = 1e-3 
 
 
 # Dataset 
@@ -508,33 +454,22 @@ model = RevViT_GLOW(img_size=img_size,
 # net = nn.DataParallel(model).to(device)
 net = model.to(device)
 
-'''
+
 # Optimizer 
-optimizer = optim.Adam(net.parameters(), lr=lr)
+optimizer = optim.Adam(net.parameters(), lr=lr, weight_decay=1e-5)
 
-def calc_loss(log_p, logdet, image_size, n_bins):
-    # log_p = calc_log_p([z_list])
-    n_pixel = image_size * image_size * 3
-
-    loss = -log(n_bins) * n_pixel # loss considering noise inputted. 
-    loss = loss + logdet + log_p
-
-    return (
-        (-loss / (log(2) * n_pixel)).mean(),
-        (log_p / (log(2) * n_pixel)).mean(),
-        (logdet / (log(2) * n_pixel)).mean(),
-    )
+def calc_loss(recons, image, mean, sigma): 
+    mean, sigma = [i.view(i.shape[0], i.shape[1] * i.shape[2]) for i in (mean, sigma)] 
+    kld_loss = torch.mean(-0.5 * torch.sum(1 + sigma - mean ** 2 - sigma.exp(), dim=1), dim=0) 
+    recons_loss = F.l1_loss(recons, image) 
+    loss = recons_loss + kld_weight * kld_loss 
+    return loss, recons_loss.detach(), kld_loss.detach() 
 
 
 # Train 
 n_bins = 2.0 ** n_bits
 
-# z_sample = []
-# z_shapes = calc_z_shapes(3, img_size, args.n_flow, args.n_block)
-# for z in z_shapes:
-#     z_new = torch.randn(args.n_sample, *z) * args.temp
-#     z_sample.append(z_new.to(device)) # TODO
-
+'''
 with tqdm(range(iteration)) as pbar: 
     for i in pbar: 
         image, _ = next(dataset)
@@ -546,35 +481,19 @@ with tqdm(range(iteration)) as pbar:
         
         image = image / n_bins - 0.5 
 
-        x = image[:,:,:,:img_size].contiguous().clone().detach().requires_grad_(True) 
-        y = image[:,:,:,img_size:].contiguous().clone().detach().requires_grad_(True)
+        mean_list, sigma_list, z_outs = net(image + torch.rand_like(image) / n_bins) 
 
-        # if i == 0:
-        #     with torch.no_grad():
-        #         log_p, logdet, y_pred = net.module(
-        #             x + torch.rand_like(x) / n_bins 
-        #         )
+        with torch.no_grad(): 
+            recons = net.reverse(z_outs) 
 
-        #         continue
+        loss, recons_loss, kld_loss = calc_loss(recons, image, mean_list, sigma_list) 
 
-        # else:
-        log_p, logdet, y_pred = net(x + torch.rand_like(x) / n_bins)  
-
-        logdet = logdet.mean()
-
-        loss1, log_p, log_det = calc_loss(log_p, logdet, img_size, n_bins)
-
-        loss = loss1 
-        net.zero_grad()
+        optimizer.zero_grad()
         loss.backward() 
-
-        _lr = lr # * min(1, i * batch_size / (50000 * 10))
-        optimizer.param_groups[0]["lr"] = _lr
         optimizer.step() 
 
         pbar.set_description(
-            # "BPDLoss: {:.5f}, L1Loss: {:.5f}".format(loss1.item(), loss2.item()) 
-            "BPDLoss: {:.5f}".format(loss1.item()) # Temp 
+            "Loss: {:.5f}, L1: {:.5f}, KL: {:.5f}".format(loss.item(), recons_loss.item(), kld_loss.item()) 
         )
 
         # if i % 100 == 0:
