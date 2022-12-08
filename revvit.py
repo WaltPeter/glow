@@ -163,6 +163,8 @@ class RevViT_GLOW(nn.Module):
         def __init__(self, dim, n_heads, n_flow, n_patches, mlp_ratio=4.0, qkv_bias=True):
             super().__init__()
 
+            self.layer_factor = 4
+
             self.flows = nn.ModuleList(
                 [
                     self.Transformer(
@@ -171,30 +173,30 @@ class RevViT_GLOW(nn.Module):
                         mlp_ratio=mlp_ratio, 
                         qkv_bias=qkv_bias, 
                     )
-                    for _ in range(n_flow)
+                    for _ in range(n_flow * self.layer_factor)
                 ]
             )
 
-            self.output_fc = nn.Linear(1+n_patches, 1) 
-            self.reverse_fc = nn.Linear(1, 1+n_patches) 
-
             latent_dim = 16*16 #TODO
-            self.norm = nn.LayerNorm(dim, eps=1e-6) 
-            self.prior = nn.Linear(dim, latent_dim*2)  
+            self.norm = nn.LayerNorm(dim*n_patches, eps=1e-6) 
+            self.prior = nn.Linear(dim*n_patches, latent_dim*2)  
 
         def forward(self, x):
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
 
-            for flow in self.flows: 
+            x_outs = list() 
+            for i, flow in enumerate(self.flows): 
                 x = flow(x) 
+                
+                if (i+1) % self.layer_factor == 0: 
+                    x, x_out = x.split([x.shape[1]-x.shape[1]//2, x.shape[1]//2], dim=1) 
+                    x_outs.append(x_out) 
+            
+            x_outs.append(x) 
+            x = torch.cat(x_outs[::-1], dim=1) 
 
             x = x.view(n_samples, n_patches, embed_dim)
-
-            # Split out the CLS token (But not forcefully) 
-            x = x.transpose(1,2) 
-            x = self.output_fc(x) 
-            x = x.transpose(1,2) 
 
             flatten = torch.flatten(x, start_dim=1) 
             mean, sigma = torch.mean( self.prior( self.norm(flatten) ), dim=0).chunk(2, -1) 
@@ -202,10 +204,6 @@ class RevViT_GLOW(nn.Module):
             return x, mean, sigma 
 
         def reverse(self, x):
-            x = x.transpose(1,2) 
-            x = self.reverse_fc(x) 
-            x = x.transpose(1,2) 
-
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
 
@@ -298,7 +296,7 @@ class RevViT_GLOW(nn.Module):
                                         dim=dim,
                                         n_flow=n_flow, 
                                         n_heads=n_heads,
-                                        n_patches=n_patches, 
+                                        n_patches=1 + n_patches, 
                                         mlp_ratio=mlp_ratio,
                                         qkv_bias=qkv_bias,
                                     )
@@ -309,7 +307,7 @@ class RevViT_GLOW(nn.Module):
                                         dim=dim,
                                         n_flow=n_flow, 
                                         n_heads=n_heads,
-                                        n_patches=n_frames, 
+                                        n_patches=1 + n_frames, 
                                         mlp_ratio=mlp_ratio,
                                         qkv_bias=qkv_bias,
                                     ) 
@@ -359,7 +357,7 @@ class RevViT_GLOW(nn.Module):
 # Dataset 
 path = r"D:\Dataset\img_align_celeba"
 batch_size = 16 
-n_frames = 1 #16
+n_frames = 16
 img_size = 96 #384
 n_bits = 5 
 
@@ -422,7 +420,7 @@ model = RevViT_GLOW(
 # net = nn.DataParallel(model).to(device)
 net = model.to(device)
 
-
+'''
 # Optimizer 
 optimizer = optim.Adam(net.parameters(), lr=lr, weight_decay=1e-5)
 
@@ -448,7 +446,7 @@ with tqdm(range(iteration)) as pbar:
         
         image = image / n_bins - 0.5 
 
-        image = image.unsqueeze(1) 
+        image = image.unsqueeze(1) # Temp
 
         x, mean_list, sigma_list = net(image + torch.rand_like(image) / n_bins) 
 
@@ -482,3 +480,4 @@ with tqdm(range(iteration)) as pbar:
                 optimizer.state_dict(), "checkpoint/optim_{}.pt".format(str(i + 1).zfill(6))
             )
 
+'''
