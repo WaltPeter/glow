@@ -164,6 +164,7 @@ class RevViT_GLOW(nn.Module):
             super().__init__()
 
             self.layer_factor = 4
+            self.n_patches = n_patches 
 
             self.flows = nn.ModuleList(
                 [
@@ -177,10 +178,6 @@ class RevViT_GLOW(nn.Module):
                 ]
             )
 
-            latent_dim = 16*16 #TODO
-            self.norm = nn.LayerNorm(dim*n_patches, eps=1e-6) 
-            self.prior = nn.Linear(dim*n_patches, latent_dim*2)  
-
         def forward(self, x):
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
@@ -190,7 +187,27 @@ class RevViT_GLOW(nn.Module):
                 x = flow(x) 
                 
                 if (i+1) % self.layer_factor == 0: 
-                    x, x_out = x.split([x.shape[1]-x.shape[1]//2, x.shape[1]//2], dim=1) 
+
+                    try: 
+                        x, x_out = x.split(
+                            [
+                                x.shape[1] - self._s[i//self.layer_factor], 
+                                self._s[i//self.layer_factor]
+                            ], 
+                            dim=1
+                        ) 
+                    except: 
+                        try: 
+                            self._s.append(x.shape[1]//2) 
+                        except: 
+                            self._s = [x.shape[1]//2] 
+                        x, x_out = x.split(
+                            [
+                                x.shape[1] - self._s[i//self.layer_factor], 
+                                self._s[i//self.layer_factor]
+                            ], 
+                            dim = 1
+                        ) 
                     x_outs.append(x_out) 
             
             x_outs.append(x) 
@@ -198,19 +215,33 @@ class RevViT_GLOW(nn.Module):
 
             x = x.view(n_samples, n_patches, embed_dim)
 
-            flatten = torch.flatten(x, start_dim=1) 
-            mean, sigma = torch.mean( self.prior( self.norm(flatten) ), dim=0).chunk(2, -1) 
-
-            return x, mean, sigma 
+            return x
 
         def reverse(self, x):
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
 
-            for flow in self.flows[::-1]:
-                x = flow.reverse(x) 
+            x_in, x = x.split([n_patches - np.sum(self._s), np.sum(self._s)], dim=1) 
 
-            x = x.view(n_samples, n_patches, embed_dim) 
+            for i, flow in enumerate(self.flows[::-1]): 
+
+                if i % self.layer_factor == 0: 
+
+                    if i < len(self.flows) - self.layer_factor: 
+                        x_, x = x.split( 
+                            [ 
+                                self._s[-i//self.layer_factor - 1], 
+                                x.shape[1] - self._s[-i//self.layer_factor - 1] 
+                            ], 
+                            dim = 1
+                        )
+                    else: 
+                        x_ = x 
+                    x_in = torch.cat([x_in, x_], dim=1) 
+
+                x_in = flow.reverse(x_in) 
+
+            x = x_in.view(n_samples, n_patches, embed_dim) 
 
             return x 
 
@@ -276,8 +307,6 @@ class RevViT_GLOW(nn.Module):
         dim = (img_size ** 2) * in_chans // n_patches 
         self.n_frames = n_frames
 
-        # print("depth: {}, n_patches: {}+{}".format(depth, split_sz, n_patches)) 
-
         super().__init__()
 
         self.patch_embed = self.PatchEmbed(
@@ -321,18 +350,17 @@ class RevViT_GLOW(nn.Module):
         x += self.pos_embed  # (b, t, 1 + n, d) 
 
         x = x.view(b*t, 1+n, d) 
-        x, mean_1, sigma_1 = self.space_transformer(x) 
-        x = x[:,0].view(b, t, -1) 
+        x = self.space_transformer(x) 
+        x = x.view(b*(1+n), t, d) 
 
-        temporal_tokens = self.temporal_token.expand(b, 1, -1)  # (b, 1, d)
+        print(x.shape) 
+
+        temporal_tokens = self.temporal_token.expand(b*(1+n), 1, -1)  # (b, 1, d)
         x = torch.cat((temporal_tokens, x), dim=1)  # (b, 1 + t, d) 
-         
-        x, mean_2, sigma_2 = self.temporal_transformer(x) 
+        
+        x = self.temporal_transformer(x) 
 
-        mean_list = torch.cat([mean_1.unsqueeze(0), mean_2.unsqueeze(0)], dim=0) 
-        sigma_list = torch.cat([sigma_1.unsqueeze(0), sigma_2.unsqueeze(0)], dim=0) 
-
-        return x, mean_list, sigma_list 
+        return x
 
     def reverse(self, x): 
         x = self.temporal_transformer.reverse(x) 
@@ -340,7 +368,8 @@ class RevViT_GLOW(nn.Module):
         _, x = x.split([1, x.shape[1]-1], dim=1) 
 
         b, t, d = x.shape 
-        x = x.contiguous().view(b*t, 1, d)
+        b //= self.space_transformer.n_patches 
+        x = x.contiguous().view(b*t, self.space_transformer.n_patches, d)
         x = self.space_transformer.reverse(x) 
 
         _, n, d = x.shape 
