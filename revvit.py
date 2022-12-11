@@ -156,15 +156,21 @@ class RevViT_GLOW(nn.Module):
                 x1, x2 = [i.unsqueeze(-1) for i in [x1, x2]]
                 return torch.cat([x2, x1], -1) 
 
-        def _sample_z(self, mean, sigma): 
-            eps = torch.randn_like(mean)
-            return mean + torch.exp(sigma / 2) * eps
-
-        def __init__(self, dim, n_heads, n_flow, n_patches, mlp_ratio=4.0, qkv_bias=True):
+        def __init__(self, dim, n_heads, n_patches, layer_factor, mlp_ratio=4.0, qkv_bias=True):
             super().__init__()
 
-            self.layer_factor = 4
+            self.layer_factor = layer_factor
             self.n_patches = n_patches 
+
+            self.s = list() 
+            while 1: 
+                n_patches = math.ceil(n_patches / 2)
+                self.s.append(n_patches) 
+                if n_patches <= 1: 
+                    break 
+
+            n_flow = len(self.s) 
+            print("depth:", n_flow)
 
             self.flows = nn.ModuleList(
                 [
@@ -178,44 +184,36 @@ class RevViT_GLOW(nn.Module):
                 ]
             )
 
-        def forward(self, x):
+        def forward(self, x) -> list: 
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
 
             x_outs = list() 
             for i, flow in enumerate(self.flows): 
+
                 x = flow(x) 
                 
                 if (i+1) % self.layer_factor == 0: 
 
-                    try: 
-                        x, x_out = x.split(
-                            [
-                                x.shape[1] - self._s[i//self.layer_factor], 
-                                self._s[i//self.layer_factor]
-                            ], 
-                            dim=1
-                        ) 
-                    except: 
-                        try: 
-                            self._s.append(x.shape[1]//2) 
-                        except: 
-                            self._s = [x.shape[1]//2] 
-                        x, x_out = x.split(
-                            [
-                                x.shape[1] - self._s[i//self.layer_factor], 
-                                self._s[i//self.layer_factor]
-                            ], 
-                            dim = 1
-                        ) 
-                    x_outs.append(x_out) 
+                    # print("* "*x.shape[1]) 
+
+                    x, x_out = x.split(
+                        [
+                            self.s[i//self.layer_factor], 
+                            x.shape[1] - self.s[i//self.layer_factor] 
+                        ], 
+                        dim=1
+                    ) 
+                    x_outs.append(x_out.view(n_samples, -1, embed_dim)) 
+
+                    # print("{}{}".format("* "*x.shape[1], "^ "*x_out.shape[1]), (x.shape[1], x_out.shape[1])) 
             
-            x_outs.append(x) 
-            x = torch.cat(x_outs[::-1], dim=1) 
+            x_outs.append(x.view(n_samples, -1, embed_dim)) 
+            # x = torch.cat(x_outs[::-1], dim=1) 
 
-            x = x.view(n_samples, n_patches, embed_dim)
+            # x = x.view(n_samples, n_patches, embed_dim)
 
-            return x
+            return x_outs[::-1]
 
         def reverse(self, x):
             n_samples, n_patches, embed_dim = x.shape 
@@ -294,12 +292,12 @@ class RevViT_GLOW(nn.Module):
 
     def __init__(
             self,
-            n_frames=1, 
-            img_size=384,
-            patch_size=16,
-            in_chans=3,
-            n_heads=12,
-            n_flow=12, 
+            n_frames, 
+            img_size,
+            patch_size,
+            in_chans,
+            n_heads,
+            layer_factor, 
             mlp_ratio=4.,
             qkv_bias=True,
     ):
@@ -323,7 +321,7 @@ class RevViT_GLOW(nn.Module):
 
         self.space_transformer = self.Block(
                                         dim=dim,
-                                        n_flow=n_flow, 
+                                        layer_factor=layer_factor, 
                                         n_heads=n_heads,
                                         n_patches=1 + n_patches, 
                                         mlp_ratio=mlp_ratio,
@@ -334,7 +332,7 @@ class RevViT_GLOW(nn.Module):
 
         self.temporal_transformer = self.Block(
                                         dim=dim,
-                                        n_flow=n_flow, 
+                                        layer_factor=layer_factor, 
                                         n_heads=n_heads,
                                         n_patches=1 + n_frames, 
                                         mlp_ratio=mlp_ratio,
@@ -351,14 +349,14 @@ class RevViT_GLOW(nn.Module):
 
         x = x.view(b*t, 1+n, d) 
         x = self.space_transformer(x) 
-        x = x.view(b*(1+n), t, d) 
 
-        print(x.shape) 
+        x[0] = x[0].view(b, -1, d) 
+        # x[0] = x[0].view(b, t*x[0].shape[2], d) 
 
-        temporal_tokens = self.temporal_token.expand(b*(1+n), 1, -1)  # (b, 1, d)
-        x = torch.cat((temporal_tokens, x), dim=1)  # (b, 1 + t, d) 
+        temporal_tokens = self.temporal_token.expand(b, 1, -1)  # (b, 1, d)
+        x[0] = torch.cat((temporal_tokens, x[0]), dim=1)  # (b, 1 + t, d) 
         
-        x = self.temporal_transformer(x) 
+        x[0] = self.temporal_transformer(x[0]) 
 
         return x
 
@@ -387,14 +385,14 @@ class RevViT_GLOW(nn.Module):
 path = r"D:\Dataset\img_align_celeba"
 batch_size = 16 
 n_frames = 16
-img_size = 96 #384
+img_size = 384 #96 #384
 n_bits = 5 
 
 # Model 
 patch_size = 16
 in_chans = 3
 n_heads = 12
-n_flow = 4 # 12 
+layer_factor = 4 # 12 
 mlp_ratio = 4.
 qkv_bias = True
 
@@ -441,7 +439,7 @@ model = RevViT_GLOW(
                 patch_size=patch_size,
                 in_chans=in_chans,
                 n_heads=n_heads,
-                n_flow=n_flow, 
+                layer_factor=layer_factor, 
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
             )
