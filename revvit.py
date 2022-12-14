@@ -1,269 +1,70 @@
-from tqdm import tqdm 
-import numpy as np 
-from PIL import Image
-import math
-
 import torch
-from torch import nn, optim
-import torch.nn.functional as F
-from torch.autograd import Variable, grad
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, utils 
-from math import log, pi, exp
-
-class GELU(nn.Module): 
-    def forward(self, x): 
-        return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+from torch import nn 
+from transformer import Transformer 
 
 
-class RevViT_GLOW(nn.Module): 
+class RevViT(nn.Module): 
 
     class Block(nn.Module):
 
-        class Transformer(nn.Module):
-
-            class Att(nn.Module): 
-                '''Attention mechanism.
-                Parameters
-                ----------
-                dim : int
-                    The input and out dimension of per token features.
-                n_heads : int
-                    Number of attention heads.
-                qkv_bias : bool
-                    If True then we include bias to the query, key and value projections.
-                attn_p : float
-                    Dropout probability applied to the query, key and value tensors.
-                proj_p : float
-                    Dropout probability applied to the output tensor.
-                '''
-
-                def __init__(self, dim, n_heads=12, qkv_bias=True):
-                    super().__init__()
-                    self.n_heads = n_heads 
-                    self.dim = dim 
-                    self.head_dim = dim // n_heads 
-                    self.scale = self.head_dim ** -0.5 
-
-                    self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias) 
-                    self.proj = nn.Linear(dim, dim)
-                
-                def forward(self, x):
-                    n_samples, n_tokens, dim = x.shape
-
-                    if dim != self.dim:
-                        raise ValueError
-
-                    qkv = self.qkv(x)  # (n_samples, n_patches + 1, 3 * dim)
-                    qkv = qkv.reshape(
-                            n_samples, n_tokens, 3, self.n_heads, self.head_dim
-                    )  # (n_samples, n_patches + 1, 3, n_heads, head_dim)
-                    qkv = qkv.permute(
-                            2, 0, 3, 1, 4
-                    )  # (3, n_samples, n_heads, n_patches + 1, head_dim)
-
-                    q, k, v = qkv[0], qkv[1], qkv[2]
-                    k_t = k.transpose(-2, -1)  # (n_samples, n_heads, head_dim, n_patches + 1)
-                    dp = (
-                    q @ k_t
-                    ) * self.scale # (n_samples, n_heads, n_patches + 1, n_patches + 1)
-                    attn = dp.softmax(dim=-1)  # (n_samples, n_heads, n_patches + 1, n_patches + 1)
-
-                    weighted_avg = attn @ v  # (n_samples, n_heads, n_patches +1, head_dim)
-                    weighted_avg = weighted_avg.transpose(
-                            1, 2
-                    )  # (n_samples, n_patches + 1, n_heads, head_dim)
-                    weighted_avg = weighted_avg.flatten(2)  # (n_samples, n_patches + 1, dim)
-
-                    x = self.proj(weighted_avg)  # (n_samples, n_patches + 1, dim)
-
-                    return x
-                
-            class MLP(nn.Module):
-                """Multilayer perceptron.
-                Parameters
-                ----------
-                in_features : int
-                    Number of input features.
-                hidden_features : int
-                    Number of nodes in the hidden layer.
-                out_features : int
-                    Number of output features.
-                p : float
-                    Dropout probability.
-                """
-
-                def __init__(self, in_features, hidden_features, out_features, p=0.):
-                    super().__init__()
-                    self.fc1 = nn.Linear(in_features, hidden_features)
-                    self.act = GELU()
-                    self.fc2 = nn.Linear(hidden_features, out_features)
-                    self.drop = nn.Dropout(p)
-
-                def forward(self, x):
-                    x = self.fc1(x) 
-                    x = self.act(x) 
-                    x = self.drop(x) 
-                    x = self.fc2(x)
-                    x = self.drop(x) 
-                    return x 
-
-            """Transformer block.
-            Parameters
-            ----------
-            dim : int
-                Embedding dimension.
-            n_heads : int
-                Number of attention heads.
-            mlp_ratio : float
-                Determines the hidden dimension size of the `MLP` module with respect
-                to `dim`.
-            qkv_bias : bool
-                If True then we include bias to the query, key and value projections.
-            p, attn_p : float
-                Dropout probability.
-            """
-
-            def __init__(self, dim, n_heads, mlp_ratio=4.0, qkv_bias=True):
-                super().__init__()
-                self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-                self.attn = self.Att(
-                        dim=dim,
-                        n_heads=n_heads,
-                        qkv_bias=qkv_bias,
-                )
-                self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-                hidden_features = int(dim * mlp_ratio)
-                self.mlp = self.MLP(
-                        in_features=dim,
-                        hidden_features=hidden_features,
-                        out_features=dim,
-                )
-
-            def forward(self, x): 
-                x2, x1 = x.chunk(2, -1)
-                x2, x1 = [i.squeeze(-1) for i in [x2, x1]]
-                y2 = x2 + self.attn(self.norm1(x1)) 
-                y1 = x1 + self.mlp(self.norm2(y2)) 
-                y2, y1 = [i.unsqueeze(-1) for i in [y2, y1]] 
-                return torch.cat([y1, y2], -1) 
-
-            def reverse(self, y): 
-                y1, y2 = y.chunk(2, -1) 
-                y1, y2 = [i.squeeze(-1) for i in [y1, y2]] 
-                x1 = y1 - self.mlp(self.norm2(y2)) 
-                x2 = y2 - self.attn(self.norm1(x1)) 
-                x1, x2 = [i.unsqueeze(-1) for i in [x1, x2]]
-                return torch.cat([x2, x1], -1) 
-
-        def __init__(self, dim, n_heads, n_patches, layer_factor, mlp_ratio=4.0, qkv_bias=True):
+        def __init__(
+                    self, 
+                    batch_size, 
+                    dim, 
+                    n_heads, 
+                    n_patches, 
+                    layer_factor, 
+                    device, 
+                    block_size=64, 
+                    mlp_ratio=4.0, 
+                    qkv_bias=True, 
+                    k=8, 
+                ):
             super().__init__()
 
             self.layer_factor = layer_factor
             self.n_patches = n_patches 
+            self.batch_size = batch_size 
 
-            self.s = list() 
-            while 1: 
-                n_patches = math.ceil(n_patches / 2)
-                self.s.append(n_patches) 
-                if n_patches <= 1: 
-                    break 
-
-            n_flow = len(self.s) 
-            print("depth:", n_flow)
+            n_flow = 1*layer_factor ##TODO
 
             self.flows = nn.ModuleList(
                 [
-                    self.Transformer(
+                    Transformer(
+                        batch_size=batch_size, 
                         dim=dim // 2, 
                         n_heads=n_heads, 
+                        n_patches=n_patches, 
+                        block_size=block_size, 
                         mlp_ratio=mlp_ratio, 
                         qkv_bias=qkv_bias, 
+                        k=k, 
+                        device=device, 
                     )
-                    for _ in range(n_flow * self.layer_factor)
-                ]
-            )
+                for _ in range(n_flow)]
+            ) 
+            print("depth:", n_flow)
 
-        def forward(self, x) -> list: 
+        def forward(self, x): 
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
 
-            x_outs = list() 
             for i, flow in enumerate(self.flows): 
-
                 x = flow(x) 
-                
-                if (i+1) % self.layer_factor == 0: 
 
-                    # print("* "*x.shape[1]) 
+            x = x.view(n_samples, n_patches, embed_dim)
 
-                    x, x_out = x.split(
-                        [
-                            self.s[i//self.layer_factor], 
-                            x.shape[1] - self.s[i//self.layer_factor] 
-                        ], 
-                        dim=1
-                    ) 
-                    x_outs.append(x_out.view(n_samples, -1, embed_dim)) 
-
-                    # print("{}{}".format("* "*x.shape[1], "^ "*x_out.shape[1]), (x.shape[1], x_out.shape[1])) 
-            
-            x_outs.append(x.view(n_samples, -1, embed_dim)) 
-            # x = torch.cat(x_outs[::-1], dim=1) 
-
-            # x = x.view(n_samples, n_patches, embed_dim)
-
-            return x_outs[::-1]
+            return x 
 
         def reverse(self, x):
             n_samples, n_patches, embed_dim = x.shape 
             x = x.view(n_samples, n_patches, embed_dim // 2, 2)
 
-            x_in, x = x.split([n_patches - np.sum(self._s), np.sum(self._s)], dim=1) 
-
             for i, flow in enumerate(self.flows[::-1]): 
+                x = flow.reverse(x) 
 
-                if i % self.layer_factor == 0: 
+            x = x.view(n_samples, n_patches, embed_dim) 
 
-                    if i < len(self.flows) - self.layer_factor: 
-                        x_, x = x.split( 
-                            [ 
-                                self._s[-i//self.layer_factor - 1], 
-                                x.shape[1] - self._s[-i//self.layer_factor - 1] 
-                            ], 
-                            dim = 1
-                        )
-                    else: 
-                        x_ = x 
-                    x_in = torch.cat([x_in, x_], dim=1) 
-
-                x_in = flow.reverse(x_in) 
-
-            x = x_in.view(n_samples, n_patches, embed_dim) 
-
-            return x 
-
-    class PatchEmbed(nn.Module):
-        # Split image into patches and then embed them.
-        def __init__(self, img_size, patch_size, in_chans=3, embed_dim=768):
-            super().__init__()
-            self.patch_size = patch_size
-            self.n_patches = img_size // patch_size 
-
-        def forward(self, x):
-            b, t, c, _, _ = x.shape 
-            x = x.view(b, t, c, self.n_patches, self.patch_size, self.n_patches, self.patch_size) 
-            x = x.permute(0,1,3,5,4,6,2).contiguous()
-            x = x.view(b, t, self.n_patches*self.n_patches, self.patch_size*self.patch_size*c) 
-            # print("Embed size:", x.shape)
-            return x 
-
-        def reverse(self, x): 
-            b, t, n, d = x.shape 
-            x = x.view(b, t, self.n_patches, self.n_patches, self.patch_size, self.patch_size, -1) 
-            c = x.shape[-1]
-            x = x.permute(0,1,6,2,4,3,5).contiguous() 
-            x = x.view(b, t, c, self.n_patches*self.patch_size, self.n_patches*self.patch_size) 
             return x 
             
 
@@ -292,14 +93,19 @@ class RevViT_GLOW(nn.Module):
 
     def __init__(
             self,
+            batch_size, 
             n_frames, 
             img_size,
             patch_size,
+            PatchEmbed, 
             in_chans,
             n_heads,
             layer_factor, 
+            device, 
+            block_size=64,
             mlp_ratio=4.,
             qkv_bias=True,
+            k=8, 
     ):
         n_patches = (img_size // patch_size) ** 2
         dim = (img_size ** 2) * in_chans // n_patches 
@@ -307,204 +113,104 @@ class RevViT_GLOW(nn.Module):
 
         super().__init__()
 
-        self.patch_embed = self.PatchEmbed(
-            img_size=img_size, 
-            patch_size=patch_size, 
-            in_chans=in_chans, 
-            embed_dim=dim
-        )
+        if PatchEmbed.TYPE == "IMAGE": 
+            self.patch_embed = PatchEmbed(
+                img_size=img_size, 
+                patch_size=patch_size, 
+                in_chans=in_chans, 
+                embed_dim=dim
+            )
+        else: raise NotImplementedError 
 
         # Position embedding. 
-        self.pos_embed = nn.Parameter(torch.randn(1, n_frames, 1 + n_patches, dim)) 
+        self.pos_embed = nn.Parameter(torch.randn(1, n_frames-1, n_patches, dim)) # 1 + n_patches, dim)) #TODO
 
         self.space_token = nn.Parameter(torch.randn(1, 1, dim)) 
 
         self.space_transformer = self.Block(
+                                        batch_size=batch_size*(n_frames-1), #batch_size, 
                                         dim=dim,
+                                        block_size=block_size,
                                         layer_factor=layer_factor, 
                                         n_heads=n_heads,
-                                        n_patches=1 + n_patches, 
+                                        n_patches=n_patches, # 1 + n_patches, #TODO
                                         mlp_ratio=mlp_ratio,
                                         qkv_bias=qkv_bias,
+                                        k=k, 
+                                        device=device, 
                                     )
 
         self.temporal_token = nn.Parameter(torch.randn(1, 1, dim))
 
         self.temporal_transformer = self.Block(
+                                        batch_size=batch_size, 
                                         dim=dim,
+                                        block_size=block_size,
                                         layer_factor=layer_factor, 
                                         n_heads=n_heads,
-                                        n_patches=1 + n_frames, 
+                                        n_patches=n_frames, # 1 + n_frames, #TODO
                                         mlp_ratio=mlp_ratio,
                                         qkv_bias=qkv_bias,
+                                        k=k, 
+                                        device=device, 
                                     ) 
 
     def forward(self, x): 
-        x = self.patch_embed(x)
+        x_embed = self.patch_embed(x)
 
-        b, t, n, d = x.shape
+        b, t, n, d = x_embed.shape
         space_tokens = self.space_token.expand(b, t, 1, -1)  # (b, t, 1, d)
-        x = torch.cat((space_tokens, x), dim=2)  # (b, t, 1 + n, d)
-        x += self.pos_embed  # (b, t, 1 + n, d) 
 
-        x = x.view(b*t, 1+n, d) 
+        #TODO: Arrange n_patches to be divisible by transformer.block_size? 
+        x = torch.cat((space_tokens, x_embed), dim=2)[:, :, :-1, :]  # (b, t, 1 + n - 1, d)
+        x += self.pos_embed  # (b, t, 1 + n - 1, d) 
+        x = x.view(b*t, n, d) ## x = x.view(b*t, 1+n, d) 
         x = self.space_transformer(x) 
 
-        x[0] = x[0].view(b, -1, d) 
-        # x[0] = x[0].view(b, t*x[0].shape[2], d) 
-
+        x_0 = x[:,0,:].view(b, -1, d) 
         temporal_tokens = self.temporal_token.expand(b, 1, -1)  # (b, 1, d)
-        x[0] = torch.cat((temporal_tokens, x[0]), dim=1)  # (b, 1 + t, d) 
-        
-        x[0] = self.temporal_transformer(x[0]) 
+        x_0 = torch.cat((temporal_tokens, x_0), dim=1)  # (b, 1 + t, d) 
+        x_0 = self.temporal_transformer(x_0) 
 
-        return x
+        return x_embed[:,:,:-1,:], (x_0, x[:,1:,:]) 
 
     def reverse(self, x): 
-        x = self.temporal_transformer.reverse(x) 
+        x_0, x = x 
 
-        _, x = x.split([1, x.shape[1]-1], dim=1) 
+        x_0 = self.temporal_transformer.reverse(x_0) 
+        _, x_0 = x_0.split([1, x_0.shape[1]-1], dim=1) 
 
-        b, t, d = x.shape 
-        b //= self.space_transformer.n_patches 
-        x = x.contiguous().view(b*t, self.space_transformer.n_patches, d)
+        b, t, d = x_0.shape 
+        x_0 = x_0.view(b*t, 1, d) 
+
+        x = torch.cat((x_0, x), dim=1) 
         x = self.space_transformer.reverse(x) 
 
         _, n, d = x.shape 
         x = x.view(b, t, n, d) 
-        
         x -= self.pos_embed 
         _, x = x.split([1, x.shape[2]-1], dim=2) 
 
+        #TODO: Arrange n_patches to be divisible by transformer.block_size? 
+        x_embed = x 
+        x = torch.cat((x, torch.zeros_like(x[:,:,0]).unsqueeze(2)), dim=2) 
         x = self.patch_embed.reverse(x)
 
-        return x
+        return x_embed, x 
 
 
-# Dataset 
-path = r"D:\Dataset\img_align_celeba"
-batch_size = 16 
-n_frames = 16
-img_size = 384 #96 #384
-n_bits = 5 
-
-# Model 
-patch_size = 16
-in_chans = 3
-n_heads = 12
-layer_factor = 4 # 12 
-mlp_ratio = 4.
-qkv_bias = True
-
-# Train 
-lr = 1e-4
-iteration = 200000
-kld_weight = 1e-3 
-
-
-# Dataset 
-def sample_data(path, batch_size, image_size):
-    transform = transforms.Compose(
-        [
-            transforms.Resize((image_size,image_size)),
-            transforms.CenterCrop((image_size,image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-        ]
-    )
-
-    dataset = datasets.ImageFolder(path, transform=transform)
-    loader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=0)
-    loader = iter(loader)
-
-    while True:
-        try:
-            yield next(loader)
-
-        except StopIteration:
-            loader = DataLoader(
-                dataset, shuffle=True, batch_size=batch_size, num_workers=0
-            )
-            loader = iter(loader)
-            yield next(loader)
-
-dataset = iter(sample_data(path, batch_size, img_size))
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# device = torch.device("cpu") 
-
-model = RevViT_GLOW(
-                n_frames=n_frames, 
-                img_size=img_size,
-                patch_size=patch_size,
-                in_chans=in_chans,
-                n_heads=n_heads,
-                layer_factor=layer_factor, 
-                mlp_ratio=mlp_ratio,
-                qkv_bias=qkv_bias,
-            )
-
-# net = nn.DataParallel(model).to(device)
-net = model.to(device)
-
-'''
-# Optimizer 
-optimizer = optim.Adam(net.parameters(), lr=lr, weight_decay=1e-5)
-
-def calc_loss(recons, image, mean, sigma): 
-    kld_loss = torch.mean(-0.5 * torch.sum(1 + sigma - mean ** 2 - sigma.exp(), dim=1), dim=0) 
-    recons_loss = F.l1_loss(recons, image) 
-    loss = recons_loss + kld_weight * kld_loss 
-    return loss, recons_loss.detach(), kld_loss.detach() 
-
-
-# Train 
-n_bins = 2.0 ** n_bits
-
-
-with tqdm(range(iteration)) as pbar: 
-    for i in pbar: 
-        image, _ = next(dataset)
-        image = image.to(device) 
-        image = image * 255 
-
-        if n_bits < 8: 
-            image = torch.floor(image/2 ** (8-n_bits)) 
-        
-        image = image / n_bins - 0.5 
-
-        image = image.unsqueeze(1) # Temp
-
-        x, mean_list, sigma_list = net(image + torch.rand_like(image) / n_bins) 
-
-        recons = net.reverse(x) 
-
-        loss, recons_loss, kld_loss = calc_loss(recons, image, mean_list, sigma_list) 
-
-        optimizer.zero_grad()
-        loss.backward() 
-        optimizer.step() 
-
-        pbar.set_description(
-            "Loss: {:.5f}, L1: {:.5f}, KL: {:.5f}".format(loss.item(), recons_loss.item(), kld_loss.item()) 
+class RevViTRev(nn.Module): 
+    def __init__(
+            self, batch_size, n_frames, img_size, patch_size, PatchEmbed, in_chans, n_heads, 
+            layer_factor, device, block_size=64, mlp_ratio=4, qkv_bias=True, k=8
+        ):
+        self.self = RevViT(
+            batch_size, n_frames, img_size, patch_size, PatchEmbed, in_chans, n_heads, 
+            layer_factor, device, block_size, mlp_ratio, qkv_bias, k
         )
 
-        # if i % 100 == 0:
-        #         with torch.no_grad():
-        #             utils.save_image(
-        #                 model.reverse(z_sample).cpu().data,
-        #                 "sample/{}.png".format(str(i + 1).zfill(6)),
-        #                 normalize=True,
-        #                 nrow=10,
-        #                 range=(-0.5, 0.5),
-        #             ) # TODO: zsample
-
-        if i % 10000 == 0:
-            torch.save(
-                model.state_dict(), "checkpoint/model_{}.pt".format(str(i + 1).zfill(6))
-            )
-            torch.save(
-                optimizer.state_dict(), "checkpoint/optim_{}.pt".format(str(i + 1).zfill(6))
-            )
-
-'''
+    def forward(self, x): 
+        return self.self.reverse(x) 
+    
+    def reverse(self, x):
+        return self.self.forward(x) 
