@@ -12,14 +12,14 @@ from torchvision import datasets, transforms, utils
 from math import log, pi, exp
 
 from embeddings import ImagePatchEmbed 
-from revvit import RevViT, RevViTRev
+from revvit import RevAiT, Model
 
 
 # Dataset 
 path = r"D:\Dataset\img_align_celeba"
 batch_size = 1 
-n_frames = 64 #128 #16
-img_size = 128 #192 #384
+n_frames = 30 #64 #128 #16
+img_size = 256 #128 #192 #384
 n_bits = 5 
 
 # Model 
@@ -27,7 +27,7 @@ patch_size = 16
 in_chans = 3
 n_heads = 12
 layer_factor = 3 #6 #12 
-block_size = 8 #16 #64 
+block_size = 4 #8 #16 #64 
 mlp_ratio = 2. #4.
 qkv_bias = True
 k = 8 
@@ -81,18 +81,32 @@ def save_image(image, name="temp.png"):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # device = torch.device("cpu") 
 
-model = RevViT(
+# model = RevAiT(
+#                 batch_size=batch_size, 
+#                 n_frames=n_frames, 
+#                 img_size=img_size,
+#                 patch_size=patch_size,
+#                 patch_embed=ImagePatchEmbed, 
+#                 in_chans=in_chans,
+#                 n_heads=n_heads,
+#                 layer_factor=layer_factor, 
+#                 mlp_ratio=mlp_ratio,
+#                 qkv_bias=qkv_bias,
+#                 k=k, 
+#                 device=device, 
+#             )
+
+model = Model(
                 batch_size=batch_size, 
                 n_frames=n_frames, 
-                img_size=img_size,
-                patch_size=patch_size,
-                PatchEmbed=ImagePatchEmbed, 
-                in_chans=in_chans,
-                n_heads=n_heads,
+                img_size=img_size, 
+                patch_size=patch_size, 
+                in_chans=in_chans, 
+                n_heads=n_heads, 
                 layer_factor=layer_factor, 
-                block_size=block_size, 
-                mlp_ratio=mlp_ratio,
-                qkv_bias=qkv_bias,
+                # block_size=6, #block_size, 
+                mlp_ratio=mlp_ratio, 
+                qkv_bias=qkv_bias, 
                 k=k, 
                 device=device, 
             )
