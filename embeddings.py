@@ -5,7 +5,7 @@ class ImagePatchEmbed(nn.Module):
     TYPE = "IMAGE" 
 
     # Split image into patches and then embed them.
-    def __init__(self, img_size, patch_size, in_chans=3, embed_dim=768):
+    def __init__(self, img_size, patch_size):
         super().__init__()
         self.patch_size = patch_size
         self.n_patches = img_size // patch_size 

@@ -75,3 +75,30 @@ class LightMLP(nn.Module):
         x = self.fc2(x)
         x = self.drop(x) 
         return x 
+
+
+class MlpBlock(nn.Module):
+    '''
+    Multilayer perceptron. 
+
+    Parameters
+    ----------
+    dim : int 
+        Number of input and output features. 
+    mlp_dim : int 
+        Number of nodes in the hidden layer. 
+    '''
+
+    def __init__(self, dim, mlp_dim=None, lite=False): 
+        super().__init__()
+        self.Linear = nn.Linear if not lite else LightDense 
+        mlp_dim = dim if mlp_dim is None else mlp_dim
+        self.linear_1 = self.Linear(dim, mlp_dim)
+        self.activation = GeLU()
+        self.linear_2 = self.Linear(mlp_dim, dim)
+
+    def forward(self, x):
+        x = self.linear_1(x) 
+        x = self.activation(x) 
+        x = self.linear_2(x) 
+        return x

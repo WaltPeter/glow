@@ -1,70 +1,15 @@
 from tqdm import tqdm 
 import numpy as np 
-from PIL import Image
 import math
 
 import torch 
-from torch import nn, optim
+from torch import optim
 import torch.nn.functional as F
-from torch.autograd import Variable, grad
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, utils 
-from math import log, pi, exp
+from torchvision import utils 
 
-from embeddings import ImagePatchEmbed 
-from revvit import RevAiT, Model
-
-
-# Dataset 
-path = r"D:\Dataset\img_align_celeba"
-batch_size = 1 
-n_frames = 30 #64 #128 #16
-img_size = 256 #128 #192 #384
-n_bits = 5 
-
-# Model 
-patch_size = 16
-in_chans = 3
-n_heads = 12
-layer_factor = 3 #6 #12 
-block_size = 4 #8 #16 #64 
-mlp_ratio = 2. #4.
-qkv_bias = True
-k = 8 
-
-# Train 
-lr = 1e-4
-iteration = 200000
-kld_weight = 1e-3 
-
-
-# Dataset 
-def sample_data(path, batch_size, image_size):
-    transform = transforms.Compose(
-        [
-            transforms.Resize((image_size,image_size)),
-            transforms.CenterCrop((image_size,image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-        ]
-    )
-
-    dataset = datasets.ImageFolder(path, transform=transform)
-    loader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=0)
-    loader = iter(loader)
-
-    while True:
-        try:
-            yield next(loader)
-
-        except StopIteration:
-            loader = DataLoader(
-                dataset, shuffle=True, batch_size=batch_size, num_workers=0
-            )
-            loader = iter(loader)
-            yield next(loader)
-
-dataset = iter(sample_data(path, batch_size, img_size))
+from config import * 
+from mlp import Model  
+from dataloader import S4Dataset 
 
 
 # Utils 
@@ -77,58 +22,94 @@ def save_image(image, name="temp.png"):
             range=(-0.5, 0.5),
         )
 
+
+# Dataset 
+train_dataset = S4Dataset("train")
+train_dataloader = torch.utils.data.DataLoader(
+                        train_dataset,
+                        batch_size=batch_size, 
+                        shuffle=True,
+                        num_workers=0,
+                        pin_memory=True, 
+                    )
+
+val_dataset = S4Dataset("val")
+val_dataloader = torch.utils.data.DataLoader(
+                        val_dataset,
+                        batch_size=batch_size,
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=True, 
+                    )
+
+
 # Model 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# device = torch.device("cpu") 
-
-# model = RevAiT(
-#                 batch_size=batch_size, 
-#                 n_frames=n_frames, 
-#                 img_size=img_size,
-#                 patch_size=patch_size,
-#                 patch_embed=ImagePatchEmbed, 
-#                 in_chans=in_chans,
-#                 n_heads=n_heads,
-#                 layer_factor=layer_factor, 
-#                 mlp_ratio=mlp_ratio,
-#                 qkv_bias=qkv_bias,
-#                 k=k, 
-#                 device=device, 
-#             )
-
 model = Model(
-                batch_size=batch_size, 
-                n_frames=n_frames, 
-                img_size=img_size, 
-                patch_size=patch_size, 
-                in_chans=in_chans, 
-                n_heads=n_heads, 
-                layer_factor=layer_factor, 
-                # block_size=6, #block_size, 
-                mlp_ratio=mlp_ratio, 
-                qkv_bias=qkv_bias, 
-                k=k, 
-                device=device, 
-            )
+            n_frames=n_frames, 
+            image_size=img_size, 
+            patch_res=patch_res, 
+            mlp_dim_D_S=mlp_dim_D_S, 
+            mlp_dim_D_C=mlp_dim_D_C, 
+            n_layers=n_layers, 
+            lite=lite, 
+        )
+
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu") 
 
 # net = nn.DataParallel(model).to(device)
 net = model.to(device)
 
-'''
+
 # Optimizer 
-optimizer = optim.Adam(net.parameters(), lr=lr, weight_decay=1e-5)
-
-def calc_loss(recons, image, mean, sigma): 
-    kld_loss = torch.mean(-0.5 * torch.sum(1 + sigma - mean ** 2 - sigma.exp(), dim=1), dim=0) 
-    recons_loss = F.l1_loss(recons, image) 
-    loss = recons_loss + kld_weight * kld_loss 
-    return loss, recons_loss.detach(), kld_loss.detach() 
-
+optimizer = optim.Adam(net.parameters(), lr=lr, betas=betas, weight_decay=weight_decay) 
 
 # Train 
-n_bins = 2.0 ** n_bits
+min_loss = math.inf 
+with tqdm(range(n_epoches)) as pbar1: 
+    for epoch in pbar1: 
+        with tqdm(enumerate(train_dataloader), total=len(train_dataloader)) as pbar2: 
+            for n_iter, batch_data in pbar2: 
+                imgs, wavs = batch_data 
+                imgs = imgs.to(device) 
+                wavs = wavs.to(device) 
+                y = model(imgs) 
+                loss = F.mse_loss(y, wavs) 
 
+                optimizer.zero_grad() 
+                loss.backward() 
+                optimizer.step()
 
+                pbar2.set_description(
+                    "Loss: {:.5f}".format(loss.item()) 
+                )
+        print() 
+
+        # Validation
+        model.eval()
+        with torch.no_grad():
+            with tqdm(enumerate(val_dataloader), total=len(val_dataloader)) as pbar2: 
+                l_list = list() 
+                for n_iter, batch_data in pbar2: 
+                    imgs, wavs = batch_data 
+                    imgs = imgs.to(device) 
+                    wavs = wavs.to(device) 
+                    y = model(imgs) 
+                    loss = F.mse_loss(y, wavs) 
+                    l_list.append(loss.item()) 
+
+                    pbar2.set_description(
+                        "ValLoss: {:.5f}".format(loss.item()) 
+                    ) 
+            l = np.mean(l_list) 
+            if l < min_loss: 
+                torch.save(model.state_dict(), "checkpoint/best_{}.pt".format(epoch)) 
+                torch.save(optimizer.state_dict(), "checkpoint/optim_{}.pt".format(epoch)) 
+                min_loss = l 
+
+        print()  
+
+'''
 with tqdm(range(iteration)) as pbar: 
     for i in pbar: 
         image, _ = next(dataset)
